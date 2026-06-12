@@ -52,5 +52,10 @@ resource "azurerm_container_app" "app" {
 
     min_replicas = 1
     max_replicas = 1
+
+    http_scale_rule {
+      name                = "http-concurrency-scaler"
+      concurrent_requests = 10
+    }
   }
 }

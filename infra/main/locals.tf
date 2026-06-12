@@ -6,4 +6,6 @@ locals {
     app         = var.app_name
     managed_by  = "terraform"
   }
+
+  slo_availability_target = 99.5
 }

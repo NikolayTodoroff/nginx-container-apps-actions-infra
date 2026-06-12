@@ -17,7 +17,7 @@ jobs:
     name: Terraform ${{ inputs.terraform_action }} — ${{ inputs.environment }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-
+    
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -48,7 +48,7 @@ jobs:
         run: |
           terraform init \
             -backend-config="resource_group_name=rg-tfstate-${{ inputs.environment }}" \
-            -backend-config="storage_account_name=stnginxstatic${{ inputs.environment }}" \
+            -backend-config="storage_account_name=stnginxaca${{ inputs.environment }}" \
             -backend-config="container_name=tfstate" \
             -backend-config="key=terraform.tfstate"
 

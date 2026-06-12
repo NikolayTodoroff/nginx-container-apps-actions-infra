@@ -1,5 +1,17 @@
 data "azurerm_client_config" "current" {}
 
+data "azurerm_policy_definition" "require_tag" {
+  display_name = "Require a tag on resources"
+}
+
+data "azurerm_policy_definition" "container_apps_https_only" {
+  display_name = "Container Apps should only be accessible over HTTPS"
+}
+
+data "azurerm_policy_definition" "container_apps_managed_identity" {
+  display_name = "Managed Identity should be enabled for Container Apps"
+}
+
 resource "azurerm_resource_group" "rg_main" {
   name     = "rg-main-${local.prefix}"
   location = var.location
@@ -55,7 +67,87 @@ module "container_app" {
   tags = local.common_tags
 }
 
-# Key Diagnostic setting — KV needs log analytics id, lives here not in key-vault module
+resource "azurerm_application_insights_workbook" "sre_dashboard" {
+  name                = "wb-sre-${local.prefix}"
+  resource_group_name = azurerm_resource_group.rg_main.name
+  location            = azurerm_resource_group.rg_main.location
+  display_name        = "SRE Dashboard — ${local.prefix}"
+  source_id           = module.monitoring.app_insights_id
+  tags                = local.common_tags
+
+  data_json = jsonencode({
+    version = "Notebook/1.0"
+    items = [
+      {
+        type = 1
+        content = {
+          json = "## SRE Dashboard\n\n**SLO Target:** ${local.slo_availability_target}% availability\n\n**Error Budget:** ${100 - local.slo_availability_target}% (~${format("%.1f", (100 - local.slo_availability_target) / 100 * 30 * 24)} hours per 30 days)"
+        }
+      },
+      {
+        type = 3
+        content = {
+          version = "KqlItem/1.0"
+          query   = "availabilityResults | where timestamp > ago(24h) | summarize SuccessRate = 100.0 * countif(success == true) / count() by bin(timestamp, 1h)"
+          size    = 0
+          title   = "Availability — Last 24 Hours"
+          timeContext = {
+            durationMs = 86400000
+          }
+          queryType    = 0
+          resourceType = "microsoft.insights/components"
+          visualization = "linechart"
+        }
+      },
+      {
+        type = 3
+        content = {
+          version = "KqlItem/1.0"
+          query   = "requests | where timestamp > ago(24h) | summarize RequestCount = count(), AvgDurationMs = avg(duration) by bin(timestamp, 1h)"
+          size    = 0
+          title   = "Request Volume and Latency — Last 24 Hours"
+          timeContext = {
+            durationMs = 86400000
+          }
+          queryType    = 0
+          resourceType = "microsoft.insights/components"
+          visualization = "linechart"
+        }
+      }
+    ]
+  })
+}
+
+resource "azurerm_resource_group_policy_assignment" "require_environment_tag" {
+  name                 = "require-env-tag-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.require_tag.id
+  display_name         = "Require environment tag — ${local.prefix}"
+  description          = "Enforces that all resources in this resource group have an 'environment' tag, supporting cost allocation and governance."
+
+  parameters = jsonencode({
+    tagName = {
+      value = "environment"
+    }
+  })
+}
+
+resource "azurerm_resource_group_policy_assignment" "container_apps_https_only" {
+  name                 = "aca-https-only-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.container_apps_https_only.id
+  display_name         = "Container Apps HTTPS only — ${local.prefix}"
+  description          = "Audits that Container Apps in this resource group are only accessible over HTTPS."
+}
+
+resource "azurerm_resource_group_policy_assignment" "container_apps_managed_identity" {
+  name                 = "aca-managed-identity-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.container_apps_managed_identity.id
+  display_name         = "Container Apps Managed Identity required — ${local.prefix}"
+  description          = "Audits that Container Apps in this resource group use Managed Identity for authentication."
+}
+
 resource "azurerm_monitor_diagnostic_setting" "keyvault_diagnostics" {
   name                       = "kv-diag-${local.prefix}"
   target_resource_id         = module.key_vault.key_vault_id
@@ -70,7 +162,6 @@ resource "azurerm_monitor_diagnostic_setting" "keyvault_diagnostics" {
   }
 }
 
-# Diagnostic setting — Container App needs log analytics id, lives here not in container-app module
 resource "azurerm_monitor_diagnostic_setting" "app_diagnostics" {
   name                       = "diag-app-${local.prefix}"
   target_resource_id         = module.container_app.container_app_id
