@@ -1,0 +1,198 @@
+name: Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - '.github/workflows/application.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and Scan
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+
+    outputs:
+      image_tag: ${{ steps.image_tag.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: image_tag
+        run: echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to dev ACR
+        run: |
+          az acr login --name acrnginxstaticdev  
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }} \
+            -t acrnginxstaticdev.azurecr.io/nginx-static/web:latest \
+            app/
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Push Docker image to dev ACR
+        run: |
+          docker push acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }}
+          docker push acrnginxstaticdev.azurecr.io/nginx-static/web:latest   
+
+  deploy-dev:
+    name: Deploy — dev
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to staging slot
+        run: |
+          az webapp config container set \
+            --name app-nginx-static-dev \
+            --resource-group rg-main-nginx-static-dev \
+            --slot staging \
+            --container-image-name acrnginxstaticdev.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }}
+
+      - name: Wait for container to start
+        run: sleep 60
+
+      - name: Smoke test staging slot
+        run: |
+          url="https://app-nginx-static-dev-staging.azurewebsites.net"
+          echo "Testing $url"
+          for i in {1..10}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$status" = "200" ]; then
+              echo "Smoke test passed — HTTP $status"
+              exit 0
+            fi
+            echo "Attempt $i — HTTP $status, retrying in 30s"
+            sleep 30
+          done
+          echo "Smoke test failed after 10 attempts"
+          exit 1
+
+      - name: Swap slots
+        run: |
+          az webapp deployment slot swap \
+            --name app-nginx-static-dev \
+            --resource-group rg-main-nginx-static-dev \
+            --slot staging \
+            --target-slot production
+
+  promote:
+    name: Promote image to prod ACR
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Import image from dev ACR to prod ACR
+        run: |
+          az acr import \
+            --name acrnginxstaticprod \
+            --source acrnginxstaticdev.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }} \
+            --image nginx-static/web:${{ needs.build.outputs.image_tag }} \
+            --force
+
+  deploy-prod:
+    name: Deploy — prod
+    needs: [build, promote]
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to staging slot
+        run: |
+          az webapp config container set \
+            --name app-nginx-static-prod \
+            --resource-group rg-main-nginx-static-prod \
+            --slot staging \
+            --container-image-name acrnginxstaticprod.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }}
+
+      - name: Wait for container to start
+        run: sleep 60
+
+      - name: Smoke test staging slot
+        run: |
+          url="https://app-nginx-static-prod-staging.azurewebsites.net"
+          echo "Testing $url"
+          for i in {1..10}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$status" = "200" ]; then
+              echo "Smoke test passed — HTTP $status"
+              exit 0
+            fi
+            echo "Attempt $i — HTTP $status, retrying in 30s"
+            sleep 30
+          done
+          echo "Smoke test failed after 10 attempts"
+          exit 1
+
+      - name: Swap slots
+        run: |
+          az webapp deployment slot swap \
+            --name app-nginx-static-prod \
+            --resource-group rg-main-nginx-static-prod \
+            --slot staging \
+            --target-slot production

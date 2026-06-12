@@ -1,0 +1,47 @@
+name: Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infrastructure.yml'
+      - '.github/workflows/reusable-terraform.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+jobs:
+  validate:
+    name: Validate — ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: [dev, prod]
+      fail-fast: false
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      environment: ${{ matrix.environment }}
+      terraform_action: plan
+    secrets: inherit
+
+  deploy-dev:
+    name: Deploy — dev
+    needs: validate
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      environment: dev
+      terraform_action: apply
+    secrets: inherit
+
+  deploy-prod:
+    name: Deploy — prod
+    needs: deploy-dev
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      environment: prod
+      terraform_action: apply
+    secrets: inherit
