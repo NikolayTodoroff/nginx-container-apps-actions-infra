@@ -1,5 +1,9 @@
 name: Application
 
+concurrency:
+  group: aca-application-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -18,6 +22,10 @@ jobs:
       id-token: write
       contents: read
       security-events: write
+
+    env:
+      ACR_SERVER: acrnginxacadev.azurecr.io
+      IMAGE_NAME: nginx-aca/web
 
     outputs:
       image_tag: ${{ steps.image_tag.outputs.tag }}
@@ -38,20 +46,19 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Login to dev ACR
-        run: |
-          az acr login --name acrnginxstaticdev  
+        run: az acr login --name acrnginxacadev
 
       - name: Build Docker image
         run: |
           docker build \
-            -t acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }} \
-            -t acrnginxstaticdev.azurecr.io/nginx-static/web:latest \
+            -t $ACR_SERVER/$IMAGE_NAME:${{ steps.image_tag.outputs.tag }} \
+            -t $ACR_SERVER/$IMAGE_NAME:latest \
             app/
 
       - name: Trivy scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }}
+          image-ref: acrnginxacadev.azurecr.io/nginx-aca/web:${{ steps.image_tag.outputs.tag }}
           format: sarif
           output: trivy.sarif
           severity: CRITICAL,HIGH
@@ -65,8 +72,8 @@ jobs:
 
       - name: Push Docker image to dev ACR
         run: |
-          docker push acrnginxstaticdev.azurecr.io/nginx-static/web:${{ steps.image_tag.outputs.tag }}
-          docker push acrnginxstaticdev.azurecr.io/nginx-static/web:latest   
+          docker push $ACR_SERVER/$IMAGE_NAME:${{ steps.image_tag.outputs.tag }}
+          docker push $ACR_SERVER/$IMAGE_NAME:latest
 
   deploy-dev:
     name: Deploy — dev
@@ -77,6 +84,12 @@ jobs:
       id-token: write
       contents: read
 
+    env:
+      APP_NAME: ca-nginx-aca-dev
+      RESOURCE_GROUP: rg-main-nginx-aca-dev
+      ACR_SERVER: acrnginxacadev.azurecr.io
+      IMAGE_NAME: nginx-aca/web
+
     steps:
       - name: Azure Login (OIDC)
         uses: azure/login@v3
@@ -85,20 +98,58 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to staging slot
+      - name: Capture current active revision
+        id: previous_revision
         run: |
-          az webapp config container set \
-            --name app-nginx-static-dev \
-            --resource-group rg-main-nginx-static-dev \
-            --slot staging \
-            --container-image-name acrnginxstaticdev.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }}
+          previous=$(az containerapp revision list \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "[?properties.trafficWeight > \`0\`].name" -o tsv | head -n1)
+          echo "name=$previous" >> $GITHUB_OUTPUT
+          echo "Previous active revision: $previous"
 
-      - name: Wait for container to start
+      - name: Configure ACR registry on Container App
+        run: |
+          az containerapp registry set \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --server $ACR_SERVER \
+            --identity system
+
+      - name: Deploy new revision
+        run: |
+          az containerapp update \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --image $ACR_SERVER/$IMAGE_NAME:${{ needs.build.outputs.image_tag }} \
+            --revision-suffix ${{ needs.build.outputs.image_tag }}
+
+      - name: Get latest revision name
+        id: latest_revision
+        run: |
+          revision=$(az containerapp show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.latestRevisionName" -o tsv)
+          echo "name=$revision" >> $GITHUB_OUTPUT
+          echo "Latest revision: $revision"
+
+      - name: Get new revision FQDN
+        id: revision_fqdn
+        run: |
+          fqdn=$(az containerapp revision show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --revision ${{ steps.latest_revision.outputs.name }} \
+            --query "properties.fqdn" -o tsv)
+          echo "fqdn=$fqdn" >> $GITHUB_OUTPUT
+
+      - name: Wait for revision to start
         run: sleep 60
 
-      - name: Smoke test staging slot
+      - name: Smoke test new revision
         run: |
-          url="https://app-nginx-static-dev-staging.azurewebsites.net"
+          url="https://${{ steps.revision_fqdn.outputs.fqdn }}"
           echo "Testing $url"
           for i in {1..10}; do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
@@ -112,13 +163,51 @@ jobs:
           echo "Smoke test failed after 10 attempts"
           exit 1
 
-      - name: Swap slots
+      - name: Shift 20% traffic to new revision (canary)
         run: |
-          az webapp deployment slot swap \
-            --name app-nginx-static-dev \
-            --resource-group rg-main-nginx-static-dev \
-            --slot staging \
-            --target-slot production
+          new_revision="${{ steps.latest_revision.outputs.name }}"
+          previous_revision="${{ steps.previous_revision.outputs.name }}"
+
+          if [ -z "$previous_revision" ]; then
+            echo "No previous revision found — first deployment, sending 100% traffic to new revision"
+            az containerapp ingress traffic set \
+              --name $APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --revision-weight "${new_revision}=100"
+          else
+            echo "Canary: 20% to $new_revision, 80% to $previous_revision"
+            az containerapp ingress traffic set \
+              --name $APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --revision-weight "${new_revision}=20" "${previous_revision}=80"
+          fi
+
+      - name: Smoke test at canary traffic (20%)
+        run: |
+          url="https://$(az containerapp show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.configuration.ingress.fqdn" -o tsv)"
+          echo "Testing $url"
+          for i in {1..5}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$status" = "200" ]; then
+              echo "Canary smoke test passed — HTTP $status"
+              exit 0
+            fi
+            echo "Attempt $i — HTTP $status, retrying in 15s"
+            sleep 15
+          done
+          echo "Canary smoke test failed after 5 attempts"
+          exit 1
+
+      - name: Promote new revision to 100%
+        run: |
+          new_revision="${{ steps.latest_revision.outputs.name }}"
+          az containerapp ingress traffic set \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --revision-weight "${new_revision}=100"
 
   promote:
     name: Promote image to prod ACR
@@ -128,6 +217,11 @@ jobs:
     permissions:
       id-token: write
       contents: read
+
+    env:
+      SOURCE_ACR: acrnginxacadev.azurecr.io
+      TARGET_ACR: acrnginxacaprod
+      IMAGE_NAME: nginx-aca/web
 
     steps:
       - name: Azure Login (OIDC)
@@ -140,9 +234,9 @@ jobs:
       - name: Import image from dev ACR to prod ACR
         run: |
           az acr import \
-            --name acrnginxstaticprod \
-            --source acrnginxstaticdev.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }} \
-            --image nginx-static/web:${{ needs.build.outputs.image_tag }} \
+            --name $TARGET_ACR \
+            --source $SOURCE_ACR/$IMAGE_NAME:${{ needs.build.outputs.image_tag }} \
+            --image $IMAGE_NAME:${{ needs.build.outputs.image_tag }} \
             --force
 
   deploy-prod:
@@ -154,6 +248,12 @@ jobs:
       id-token: write
       contents: read
 
+    env:
+      APP_NAME: ca-nginx-aca-prod
+      RESOURCE_GROUP: rg-main-nginx-aca-prod
+      ACR_SERVER: acrnginxacaprod.azurecr.io
+      IMAGE_NAME: nginx-aca/web
+
     steps:
       - name: Azure Login (OIDC)
         uses: azure/login@v3
@@ -162,20 +262,58 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to staging slot
+      - name: Capture current active revision
+        id: previous_revision
         run: |
-          az webapp config container set \
-            --name app-nginx-static-prod \
-            --resource-group rg-main-nginx-static-prod \
-            --slot staging \
-            --container-image-name acrnginxstaticprod.azurecr.io/nginx-static/web:${{ needs.build.outputs.image_tag }}
+          previous=$(az containerapp revision list \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "[?properties.trafficWeight > \`0\`].name" -o tsv | head -n1)
+          echo "name=$previous" >> $GITHUB_OUTPUT
+          echo "Previous active revision: $previous"
 
-      - name: Wait for container to start
+      - name: Configure ACR registry on Container App
+        run: |
+          az containerapp registry set \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --server $ACR_SERVER \
+            --identity system
+
+      - name: Deploy new revision
+        run: |
+          az containerapp update \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --image $ACR_SERVER/$IMAGE_NAME:${{ needs.build.outputs.image_tag }} \
+            --revision-suffix ${{ needs.build.outputs.image_tag }}
+
+      - name: Get latest revision name
+        id: latest_revision
+        run: |
+          revision=$(az containerapp show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.latestRevisionName" -o tsv)
+          echo "name=$revision" >> $GITHUB_OUTPUT
+          echo "Latest revision: $revision"
+
+      - name: Get new revision FQDN
+        id: revision_fqdn
+        run: |
+          fqdn=$(az containerapp revision show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --revision ${{ steps.latest_revision.outputs.name }} \
+            --query "properties.fqdn" -o tsv)
+          echo "fqdn=$fqdn" >> $GITHUB_OUTPUT
+
+      - name: Wait for revision to start
         run: sleep 60
 
-      - name: Smoke test staging slot
+      - name: Smoke test new revision
         run: |
-          url="https://app-nginx-static-prod-staging.azurewebsites.net"
+          url="https://${{ steps.revision_fqdn.outputs.fqdn }}"
           echo "Testing $url"
           for i in {1..10}; do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
@@ -189,10 +327,48 @@ jobs:
           echo "Smoke test failed after 10 attempts"
           exit 1
 
-      - name: Swap slots
+      - name: Shift 20% traffic to new revision (canary)
         run: |
-          az webapp deployment slot swap \
-            --name app-nginx-static-prod \
-            --resource-group rg-main-nginx-static-prod \
-            --slot staging \
-            --target-slot production
+          new_revision="${{ steps.latest_revision.outputs.name }}"
+          previous_revision="${{ steps.previous_revision.outputs.name }}"
+
+          if [ -z "$previous_revision" ]; then
+            echo "No previous revision found — first deployment, sending 100% traffic to new revision"
+            az containerapp ingress traffic set \
+              --name $APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --revision-weight "${new_revision}=100"
+          else
+            echo "Canary: 20% to $new_revision, 80% to $previous_revision"
+            az containerapp ingress traffic set \
+              --name $APP_NAME \
+              --resource-group $RESOURCE_GROUP \
+              --revision-weight "${new_revision}=20" "${previous_revision}=80"
+          fi
+
+      - name: Smoke test at canary traffic (20%)
+        run: |
+          url="https://$(az containerapp show \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "properties.configuration.ingress.fqdn" -o tsv)"
+          echo "Testing $url"
+          for i in {1..5}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+            if [ "$status" = "200" ]; then
+              echo "Canary smoke test passed — HTTP $status"
+              exit 0
+            fi
+            echo "Attempt $i — HTTP $status, retrying in 15s"
+            sleep 15
+          done
+          echo "Canary smoke test failed after 5 attempts"
+          exit 1
+
+      - name: Promote new revision to 100%
+        run: |
+          new_revision="${{ steps.latest_revision.outputs.name }}"
+          az containerapp ingress traffic set \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --revision-weight "${new_revision}=100"

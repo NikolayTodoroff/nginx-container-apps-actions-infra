@@ -1,0 +1,23 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+      - '.github/workflows/pr-validation.yml'
+      - '.github/workflows/reusable-terraform.yml'
+
+jobs:
+  validate:
+    name: Validate — ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: [dev, prod]
+      fail-fast: false
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      environment: ${{ matrix.environment }}
+      terraform_action: plan
+    secrets: inherit
