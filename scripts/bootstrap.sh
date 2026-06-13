@@ -2,7 +2,7 @@ set -e
 
 ENV=$1
 LOCATION=$2
-APP_NAME="nginxapps"
+APP_NAME="nginxaca"
 
 if [ -z "$ENV" ] || [ -z "$LOCATION" ]; then
   echo "Usage: ./scripts/bootstrap.sh <environment> <location>"

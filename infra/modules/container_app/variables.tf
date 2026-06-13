@@ -23,10 +23,9 @@ variable "acr_login_server" {
   type        = string
 }
 
-variable "docker_image_name" {
+variable "container_image_name" {
   description = "Docker image name and tag"
   type        = string
-  default     = "nginx-static/web:latest"
 }
 
 variable "key_vault_uri" {

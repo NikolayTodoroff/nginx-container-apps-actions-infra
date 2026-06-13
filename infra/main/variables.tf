@@ -35,10 +35,10 @@ variable "log_analytics_retention_days" {
   default     = 30
 }
 
-variable "docker_image_name" {
+variable "container_image_name" {
   description = "Docker image name and tag"
   type        = string
-  default     = "nginx-aca/web:latest"
+  default     = "mcr.microsoft.com/k8se/quickstart:latest"
 }
 
 variable "admin_email" {

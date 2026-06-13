@@ -52,12 +52,12 @@ module "monitoring" {
 }
 
 module "container_app" {
-  source = "../modules/container-app"
+  source = "../modules/container_app"
 
   prefix              = local.prefix
   resource_group_name = azurerm_resource_group.rg_main.name
   location            = azurerm_resource_group.rg_main.location
-  docker_image_name   = var.docker_image_name
+  container_image_name = var.container_image_name
 
   log_analytics_workspace_id     = module.monitoring.log_analytics_workspace_id
   acr_login_server               = module.container_registry.login_server
@@ -67,12 +67,16 @@ module "container_app" {
   tags = local.common_tags
 }
 
+resource "random_uuid" "sre_dashboard" {}
+
 resource "azurerm_application_insights_workbook" "sre_dashboard" {
-  name                = "wb-sre-${local.prefix}"
+  name                = random_uuid.sre_dashboard.result
   resource_group_name = azurerm_resource_group.rg_main.name
   location            = azurerm_resource_group.rg_main.location
   display_name        = "SRE Dashboard — ${local.prefix}"
-  source_id           = module.monitoring.app_insights_id
+
+  # Workbook API requires lowercase ARM resource IDs
+  source_id = lower(module.monitoring.app_insights_id)
   tags                = local.common_tags
 
   data_json = jsonencode({
@@ -118,34 +122,57 @@ resource "azurerm_application_insights_workbook" "sre_dashboard" {
   })
 }
 
-resource "azurerm_resource_group_policy_assignment" "require_environment_tag" {
-  name                 = "require-env-tag-${local.prefix}"
-  resource_group_id    = azurerm_resource_group.rg_main.id
-  policy_definition_id = data.azurerm_policy_definition.require_tag.id
-  display_name         = "Require environment tag — ${local.prefix}"
-  description          = "Enforces that all resources in this resource group have an 'environment' tag, supporting cost allocation and governance."
+resource "azurerm_application_insights_standard_web_test" "availability" {
+  name                    = "avail-${local.prefix}"
+  resource_group_name     = azurerm_resource_group.rg_main.name
+  location                = azurerm_resource_group.rg_main.location
+  application_insights_id = module.monitoring.app_insights_id
+  frequency               = 300
+  timeout                 = 30
+  enabled                 = true
+  geo_locations           = ["emea-nl-ams-azr", "emea-gb-db3-azr"]
 
-  parameters = jsonencode({
-    tagName = {
-      value = "environment"
-    }
-  })
+  request {
+    url = "https://${module.container_app.container_app_fqdn}"
+  }
+
+  tags = local.common_tags
 }
 
-resource "azurerm_resource_group_policy_assignment" "container_apps_https_only" {
-  name                 = "aca-https-only-${local.prefix}"
-  resource_group_id    = azurerm_resource_group.rg_main.id
-  policy_definition_id = data.azurerm_policy_definition.container_apps_https_only.id
-  display_name         = "Container Apps HTTPS only — ${local.prefix}"
-  description          = "Audits that Container Apps in this resource group are only accessible over HTTPS."
+resource "azurerm_monitor_metric_alert" "availability_alert" {
+  name                = "alert-avail-${local.prefix}"
+  resource_group_name = azurerm_resource_group.rg_main.name
+  scopes              = [module.monitoring.app_insights_id]
+  description         = "Alert when availability drops below 100%"
+  severity            = 2
+  frequency           = "PT5M"
+  window_size         = "PT15M"
+  tags = local.common_tags
+  
+  criteria {
+    metric_namespace = "Microsoft.Insights/components"
+    metric_name      = "availabilityResults/availabilityPercentage"
+    aggregation      = "Average"
+    operator         = "LessThan"
+    threshold        = 100
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.email_alert.id
+  }
 }
 
-resource "azurerm_resource_group_policy_assignment" "container_apps_managed_identity" {
-  name                 = "aca-managed-identity-${local.prefix}"
-  resource_group_id    = azurerm_resource_group.rg_main.id
-  policy_definition_id = data.azurerm_policy_definition.container_apps_managed_identity.id
-  display_name         = "Container Apps Managed Identity required — ${local.prefix}"
-  description          = "Audits that Container Apps in this resource group use Managed Identity for authentication."
+resource "azurerm_monitor_action_group" "email_alert" {
+  name                = "ag-${local.prefix}"
+  resource_group_name = azurerm_resource_group.rg_main.name
+  short_name          = "avail-alert"
+
+  email_receiver {
+    name          = "admin"
+    email_address = var.admin_email
+  }
+
+  tags = local.common_tags
 }
 
 resource "azurerm_monitor_diagnostic_setting" "keyvault_diagnostics" {
@@ -180,54 +207,32 @@ resource "azurerm_monitor_diagnostic_setting" "app_diagnostics" {
   }
 }
 
-resource "azurerm_application_insights_standard_web_test" "availability" {
-  name                    = "avail-${local.prefix}"
-  resource_group_name     = azurerm_resource_group.rg_main.name
-  location                = azurerm_resource_group.rg_main.location
-  application_insights_id = azurerm_application_insights.app_insights.id
-  frequency               = 300
-  timeout                 = 30
-  enabled                 = true
-  geo_locations           = ["emea-nl-ams-azr", "emea-gb-db3-azr"]
+resource "azurerm_resource_group_policy_assignment" "require_environment_tag" {
+  name                 = "require-env-tag-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.require_tag.id
+  display_name         = "Require environment tag — ${local.prefix}"
+  description          = "Enforces that all resources in this resource group have an 'environment' tag, supporting cost allocation and governance."
 
-  request {
-    url = "https://${module.container_app.container_app_fqdn}"
-  }
-
-  tags = local.common_tags
+  parameters = jsonencode({
+    tagName = {
+      value = "environment"
+    }
+  })
 }
 
-resource "azurerm_monitor_metric_alert" "availability_alert" {
-  name                = "alert-avail-${local.prefix}"
-  resource_group_name = azurerm_resource_group.rg_main.name
-  scopes              = [azurerm_application_insights.app_insights.id]
-  description         = "Alert when availability drops below 100%"
-  severity            = 2
-  frequency           = "PT5M"
-  window_size         = "PT15M"
-
-  criteria {
-    metric_namespace = "Microsoft.Insights/components"
-    metric_name      = "availabilityResults/availabilityPercentage"
-    aggregation      = "Average"
-    operator         = "LessThan"
-    threshold        = 100
-  }
-
-  action {
-    action_group_id = azurerm_monitor_action_group.email_alert.id
-  }
+resource "azurerm_resource_group_policy_assignment" "container_apps_https_only" {
+  name                 = "aca-https-only-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.container_apps_https_only.id
+  display_name         = "Container Apps HTTPS only — ${local.prefix}"
+  description          = "Audits that Container Apps in this resource group are only accessible over HTTPS."
 }
 
-resource "azurerm_monitor_action_group" "email_alert" {
-  name                = "ag-${local.prefix}"
-  resource_group_name = azurerm_resource_group.rg_main.name
-  short_name          = "avail-alert"
-
-  email_receiver {
-    name          = "admin"
-    email_address = var.admin_email
-  }
-
-  tags = local.common_tags
+resource "azurerm_resource_group_policy_assignment" "container_apps_managed_identity" {
+  name                 = "aca-managed-identity-${local.prefix}"
+  resource_group_id    = azurerm_resource_group.rg_main.id
+  policy_definition_id = data.azurerm_policy_definition.container_apps_managed_identity.id
+  display_name         = "Container Apps Managed Identity required — ${local.prefix}"
+  description          = "Audits that Container Apps in this resource group use Managed Identity for authentication."
 }

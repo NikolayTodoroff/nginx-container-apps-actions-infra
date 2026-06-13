@@ -57,8 +57,12 @@ jobs:
 
       - name: TFLint Setup
         uses: terraform-linters/setup-tflint@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: TFLint Run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tflint --init --config=${{ github.workspace }}/infra/.tflint.hcl
           tflint --config=${{ github.workspace }}/infra/.tflint.hcl

@@ -3,6 +3,7 @@ resource "azurerm_container_app_environment" "environment" {
   resource_group_name        = var.resource_group_name
   location                   = var.location
   log_analytics_workspace_id = var.log_analytics_workspace_id
+  logs_destination           = "log-analytics"
   tags                       = var.tags
 }
 
@@ -34,8 +35,8 @@ resource "azurerm_container_app" "app" {
 
   template {
     container {
-      name   = "nginx-static"
-      image  = "${var.acr_login_server}/${var.docker_image_name}"
+      name   = "nginx-aca"
+      image = var.container_image_name
       cpu    = 0.25
       memory = "0.5Gi"
 
@@ -57,5 +58,11 @@ resource "azurerm_container_app" "app" {
       name                = "http-concurrency-scaler"
       concurrent_requests = 10
     }
+  }
+
+  lifecycle {
+    ignore_changes = [
+      template[0].container[0].image
+    ]
   }
 }
