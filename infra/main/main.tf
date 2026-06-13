@@ -191,15 +191,15 @@ resource "azurerm_monitor_diagnostic_setting" "keyvault_diagnostics" {
 
 resource "azurerm_monitor_diagnostic_setting" "app_diagnostics" {
   name                       = "diag-app-${local.prefix}"
-  target_resource_id         = module.container_app.container_app_id
+  target_resource_id         = module.container_app.container_app_environment_id
   log_analytics_workspace_id = module.monitoring.log_analytics_workspace_id
 
   enabled_log {
-    category = "AppServiceHTTPLogs"
+    category = "ContainerAppConsoleLogs"
   }
 
   enabled_log {
-    category = "AppServiceAppLogs"
+    category = "ContainerAppSystemLogs"
   }
 
   enabled_metric {

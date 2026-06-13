@@ -18,11 +18,6 @@ resource "azurerm_container_app" "app" {
     type = "SystemAssigned"
   }
 
-  registry {
-    server   = var.acr_login_server
-    identity = "System"
-  }
-
   ingress {
     external_enabled = true
     target_port      = 80
@@ -62,7 +57,8 @@ resource "azurerm_container_app" "app" {
 
   lifecycle {
     ignore_changes = [
-      template[0].container[0].image
+      template[0].container[0].image,
+      registry,
     ]
   }
 }
